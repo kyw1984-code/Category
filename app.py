@@ -10,21 +10,31 @@ import io
 from urllib.parse import urlencode
 
 # ---------------------------------------------------------
-# 1. 쿠팡 API 서명 생성 함수
+# 1. 쿠팡 공식 가이드 기반 HMAC 서명 생성 함수 (수정됨)
 # ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
+    """
+    쿠팡 공식 문서 로직 적용:
+    Message = datetimeGMT + method + path + (query if exists)
+    """
+    # URL에서 경로(path)와 쿼리(query) 분리
+    parts = url.split("?")
+    path = parts[0]
+    query = parts[1] if len(parts) > 1 else ""
+
+    # UTC 시간 생성 (공식 코드 포맷: YYMMDDThhmmssZ)
     now_utc = datetime.now(timezone.utc)
-    date_gmt = now_utc.strftime('%y%m%d')
-    time_gmt = now_utc.strftime('%H%M%S')
-    dateTime = date_gmt + 'T' + time_gmt + 'Z'
-    
-    message = method + url + dateTime + access_key
-    
-    signature = hmac.new(bytes(secret_key, 'utf-8'),
-                         message.encode('utf-8'),
+    datetimeGMT = now_utc.strftime('%y%m%d') + 'T' + now_utc.strftime('%H%M%S') + 'Z'
+
+    # [핵심 변경] 공식 가이드 순서대로 조합
+    message = datetimeGMT + method + path + query
+
+    # 서명 생성
+    signature = hmac.new(bytes(secret_key, "utf-8"),
+                         message.encode("utf-8"),
                          hashlib.sha256).hexdigest()
-    
-    return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={dateTime}, signature={signature}"
+
+    return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={datetimeGMT}, signature={signature}"
 
 # ---------------------------------------------------------
 # 2. 데이터 호출 함수
@@ -32,10 +42,19 @@ def generate_hmac(method, url, secret_key, access_key):
 def get_best_products(access_key, secret_key, category_id, limit=20):
     DOMAIN = "https://api-gateway.coupang.com"
     PATH = "/v2/providers/affiliate_sdp/pa/products/ranking"
-    QUERY = f"?categoryId={category_id}&limit={limit}"
-    FULL_URL = PATH + QUERY
     
-    authorization = generate_hmac("GET", FULL_URL, secret_key, access_key)
+    # 쿼리 스트링 수동 생성 (서명과 요청의 일치를 위해)
+    params = {
+        "categoryId": category_id,
+        "limit": limit
+    }
+    query_string = urlencode(params)
+    
+    # 전체 URL 조립 (Path + Query)
+    full_url = f"{PATH}?{query_string}"
+    
+    # 공식 로직으로 헤더 생성
+    authorization = generate_hmac("GET", full_url, secret_key, access_key)
     
     headers = {
         "Authorization": authorization,
@@ -43,11 +62,17 @@ def get_best_products(access_key, secret_key, category_id, limit=20):
     }
     
     try:
-        response = requests.get(DOMAIN + FULL_URL, headers=headers)
+        # requests 호출 시 전체 URL 사용
+        response = requests.get(DOMAIN + full_url, headers=headers)
+        
         if response.status_code == 200:
             return response.json()
         else:
-            return {"error": True, "status": response.status_code, "msg": response.text}
+            return {
+                "error": True, 
+                "status": response.status_code, 
+                "msg": response.text
+            }
     except Exception as e:
         return {"error": True, "msg": str(e)}
 
@@ -59,8 +84,8 @@ def to_excel(df):
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
         worksheet = writer.sheets['Sheet1']
-        worksheet.set_column('B:B', 40)
-        worksheet.set_column('E:E', 50)
+        worksheet.set_column('B:B', 40) # 상품명 넓게
+        worksheet.set_column('E:E', 50) # URL 넓게
     return output.getvalue()
 
 # ---------------------------------------------------------
@@ -71,27 +96,15 @@ def main():
 
     st.title("🛍️ 쿠팡 파트너스 베스트 상품 추출")
     
-    # [보안 강화] 화면 입력창 삭제 -> Secrets에서만 로드
+    # Secrets 로드
     try:
-        # Streamlit Cloud의 Secrets에서 키를 가져옵니다.
-        # 공백 제거(.strip())를 통해 실수 방지
         ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip()
         SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip()
     except (FileNotFoundError, KeyError):
-        # 키가 설정되지 않았을 때만 경고 메시지 표시
         st.error("🚨 API 키가 설정되지 않았습니다.")
-        st.info("""
-        **[설정 방법]**
-        1. Streamlit Cloud 대시보드 접속
-        2. 앱의 'Settings' > 'Secrets' 메뉴 클릭
-        3. 아래 내용을 복사해서 붙여넣고 저장하세요.
-        
-        COUPANG_ACCESS_KEY = "본인의_액세스키"
-        COUPANG_SECRET_KEY = "본인의_시크릿키"
-        """)
-        st.stop() # 키가 없으면 아래 코드를 실행하지 않음
+        st.info("Streamlit Cloud의 'Secrets' 설정에 COUPANG_ACCESS_KEY와 COUPANG_SECRET_KEY를 등록해주세요.")
+        st.stop()
 
-    # 사이드바 설정 (키 입력창 없음)
     st.sidebar.header("📂 검색 옵션")
     
     categories = {
@@ -144,6 +157,8 @@ def main():
             elif "error" in res:
                 st.error("API 호출 실패")
                 st.code(res['msg'], language='json')
+                if "Provider id is not specified correctly" in str(res):
+                     st.warning("⚠️ '쿠팡 윙' 키가 아닌 '파트너스' 키인지 다시 확인해주세요.")
 
 if __name__ == "__main__":
     main()
