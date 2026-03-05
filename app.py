@@ -7,19 +7,17 @@ import time
 from datetime import datetime, timezone
 import pandas as pd
 import io
-from urllib.parse import quote
+from urllib.parse import urlencode
 
 # ---------------------------------------------------------
 # 1. 쿠팡 API 서명 생성 함수
 # ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
-    # UTC 시간 생성 (쿠팡 서버 기준)
     now_utc = datetime.now(timezone.utc)
     date_gmt = now_utc.strftime('%y%m%d')
     time_gmt = now_utc.strftime('%H%M%S')
     dateTime = date_gmt + 'T' + time_gmt + 'Z'
     
-    # 서명 메시지 생성
     message = method + url + dateTime + access_key
     
     signature = hmac.new(bytes(secret_key, 'utf-8'),
@@ -33,16 +31,11 @@ def generate_hmac(method, url, secret_key, access_key):
 # ---------------------------------------------------------
 def get_best_products(access_key, secret_key, category_id, limit=20):
     DOMAIN = "https://api-gateway.coupang.com"
-    # URL 경로와 쿼리 파라미터를 정확히 조립
     PATH = "/v2/providers/affiliate_sdp/pa/products/ranking"
     QUERY = f"?categoryId={category_id}&limit={limit}"
     FULL_URL = PATH + QUERY
     
-    # 공백 제거
-    ak = access_key.strip()
-    sk = secret_key.strip()
-    
-    authorization = generate_hmac("GET", FULL_URL, sk, ak)
+    authorization = generate_hmac("GET", FULL_URL, secret_key, access_key)
     
     headers = {
         "Authorization": authorization,
@@ -51,15 +44,10 @@ def get_best_products(access_key, secret_key, category_id, limit=20):
     
     try:
         response = requests.get(DOMAIN + FULL_URL, headers=headers)
-        
         if response.status_code == 200:
             return response.json()
         else:
-            return {
-                "error": True, 
-                "status": response.status_code, 
-                "msg": response.text
-            }
+            return {"error": True, "status": response.status_code, "msg": response.text}
     except Exception as e:
         return {"error": True, "msg": str(e)}
 
@@ -71,8 +59,8 @@ def to_excel(df):
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
         worksheet = writer.sheets['Sheet1']
-        worksheet.set_column('B:B', 40) # 상품명
-        worksheet.set_column('E:E', 50) # URL
+        worksheet.set_column('B:B', 40)
+        worksheet.set_column('E:E', 50)
     return output.getvalue()
 
 # ---------------------------------------------------------
@@ -82,23 +70,30 @@ def main():
     st.set_page_config(page_title="쿠팡 소싱 리스트", layout="wide")
 
     st.title("🛍️ 쿠팡 파트너스 베스트 상품 추출")
-    st.info("반드시 '쿠팡 윙(판매자)' 키가 아닌 **'쿠팡 파트너스' API 키**를 사용해야 합니다.")
-
-    # 사이드바 설정
-    st.sidebar.header("🔑 파트너스 API 키")
     
-    # Secrets 우선 로드
-    ak = st.secrets.get("COUPANG_ACCESS_KEY", "")
-    sk = st.secrets.get("COUPANG_SECRET_KEY", "")
+    # [보안 강화] 화면 입력창 삭제 -> Secrets에서만 로드
+    try:
+        # Streamlit Cloud의 Secrets에서 키를 가져옵니다.
+        # 공백 제거(.strip())를 통해 실수 방지
+        ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip()
+        SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip()
+    except (FileNotFoundError, KeyError):
+        # 키가 설정되지 않았을 때만 경고 메시지 표시
+        st.error("🚨 API 키가 설정되지 않았습니다.")
+        st.info("""
+        **[설정 방법]**
+        1. Streamlit Cloud 대시보드 접속
+        2. 앱의 'Settings' > 'Secrets' 메뉴 클릭
+        3. 아래 내용을 복사해서 붙여넣고 저장하세요.
+        
+        COUPANG_ACCESS_KEY = "본인의_액세스키"
+        COUPANG_SECRET_KEY = "본인의_시크릿키"
+        """)
+        st.stop() # 키가 없으면 아래 코드를 실행하지 않음
 
-    if not ak:
-        ak = st.sidebar.text_input("Access Key", type="password")
-    if not sk:
-        sk = st.sidebar.text_input("Secret Key", type="password")
-
-    st.sidebar.markdown("---")
+    # 사이드바 설정 (키 입력창 없음)
+    st.sidebar.header("📂 검색 옵션")
     
-    # 카테고리 목록
     categories = {
         "여성패션": 1001, "남성패션": 1002, "뷰티": 1010, 
         "출산/유아동": 1011, "식품": 1012, "주방용품": 1013, 
@@ -110,13 +105,9 @@ def main():
     cat_name = st.sidebar.selectbox("카테고리", list(categories.keys()))
     limit = st.sidebar.slider("개수", 10, 50, 20)
 
-    if st.sidebar.button("가져오기"):
-        if not ak or not sk:
-            st.warning("API 키를 입력해주세요.")
-            return
-
+    if st.sidebar.button("데이터 가져오기"):
         with st.spinner("데이터 요청 중..."):
-            res = get_best_products(ak, sk, categories[cat_name], limit)
+            res = get_best_products(ACCESS_KEY, SECRET_KEY, categories[cat_name], limit)
 
             if "data" in res:
                 items = res['data']
@@ -132,10 +123,8 @@ def main():
                     })
                 
                 df = pd.DataFrame(rows)
+                st.success(f"✅ {len(df)}개 상품 로드 완료")
                 
-                st.success(f"{len(df)}개 상품을 찾았습니다!")
-                
-                # 테이블 출력
                 st.dataframe(
                     df,
                     column_config={
@@ -146,7 +135,6 @@ def main():
                     hide_index=True
                 )
                 
-                # 엑셀 다운로드
                 st.download_button(
                     "📥 엑셀 다운로드",
                     to_excel(df),
@@ -155,9 +143,7 @@ def main():
 
             elif "error" in res:
                 st.error("API 호출 실패")
-                st.json(res)
-                if "Provider id is not specified correctly" in str(res):
-                    st.error("🚨 **원인 발견:** '쿠팡 파트너스' 키가 아닌 다른 키(예: 윙 판매자 키)를 넣으신 것 같습니다. 파트너스 홈페이지에서 키를 다시 확인해주세요.")
+                st.code(res['msg'], language='json')
 
 if __name__ == "__main__":
     main()
