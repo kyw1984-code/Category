@@ -4,6 +4,7 @@ import hashlib
 import requests
 import json
 import time
+from datetime import datetime, timezone
 import pandas as pd
 import io
 from urllib.parse import urlencode
@@ -13,9 +14,14 @@ from urllib.parse import urlencode
 # ---------------------------------------------------------
 def generate_hmac(method, url, secret_key, access_key):
     """
-    쿠팡 파트너스 API 호출을 위한 HMAC 서명 생성
+    쿠팡 파트너스 API 호출을 위한 HMAC 서명 생성 (UTC 시간 적용)
     """
-    dateTime = time.strftime('%y%m%d') + 'T' + time.strftime('%H%M%S') + 'Z'
+    # [수정됨] 한국 시간이 아닌 UTC(표준시) 기준으로 서명 생성해야 400/401 에러가 안 납니다.
+    now_utc = datetime.now(timezone.utc)
+    date_gmt = now_utc.strftime('%y%m%d')
+    time_gmt = now_utc.strftime('%H%M%S')
+    
+    dateTime = date_gmt + 'T' + time_gmt + 'Z'
     message = method + url + dateTime + access_key
     
     signature = hmac.new(bytes(secret_key, 'utf-8'),
@@ -37,23 +43,28 @@ def get_best_products(access_key, secret_key, category_id, limit=20):
         "limit": limit
     }
     
-    # URL 인코딩 및 전체 URL 생성
+    # URL 인코딩
     query_string = urlencode(params)
     full_url = f"{URL}?{query_string}"
     
-    # 헤더 생성
-    authorization = generate_hmac("GET", full_url, secret_key, access_key)
+    # 헤더 생성 (키 앞뒤 공백 제거 적용)
+    authorization = generate_hmac("GET", full_url, secret_key.strip(), access_key.strip())
     headers = {
         "Authorization": authorization,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3"
     }
     
     try:
         response = requests.get(DOMAIN + full_url, headers=headers)
-        response.raise_for_status()
+        
+        # [수정됨] 400 에러 발생 시 구체적인 이유를 알기 위해 예외 처리 강화
+        if response.status_code != 200:
+            return {"error": f"상태 코드: {response.status_code}", "detail": response.text}
+            
         return response.json()
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": "통신 오류", "detail": str(e)}
 
 # ---------------------------------------------------------
 # 2. 엑셀 다운로드 처리 함수
@@ -64,9 +75,8 @@ def to_excel(df):
         df.to_excel(writer, index=False, sheet_name='Sheet1')
         workbook = writer.book
         worksheet = writer.sheets['Sheet1']
-        # 컬럼 너비 조정 (선택사항)
-        worksheet.set_column('B:B', 40) # 상품명 컬럼 넓게
-        worksheet.set_column('D:D', 50) # URL 컬럼 넓게
+        worksheet.set_column('B:B', 40) # 상품명
+        worksheet.set_column('E:E', 50) # 링크
     
     processed_data = output.getvalue()
     return processed_data
@@ -83,14 +93,20 @@ def main():
     # 사이드바: 설정 영역
     st.sidebar.header("🔑 API 설정")
     
-    # Streamlit Secrets에서 키를 우선 로드하고, 없으면 입력창 사용
-    api_access_key = st.sidebar.text_input("Access Key", type="password")
-    api_secret_key = st.sidebar.text_input("Secret Key", type="password")
+    # Secrets에서 키 로드 시도
+    api_access_key = st.secrets.get("COUPANG_ACCESS_KEY", "")
+    api_secret_key = st.secrets.get("COUPANG_SECRET_KEY", "")
+
+    # Secrets에 없으면 입력창 표시
+    if not api_access_key:
+        api_access_key = st.sidebar.text_input("Access Key", type="password")
+    if not api_secret_key:
+        api_secret_key = st.sidebar.text_input("Secret Key", type="password")
 
     st.sidebar.markdown("---")
     st.sidebar.header("📂 검색 옵션")
 
-    # 주요 카테고리 ID 매핑 (필요에 따라 추가/수정 가능)
+    # 주요 카테고리 ID 매핑
     categories = {
         "여성패션": 1001,
         "남성패션": 1002,
@@ -126,7 +142,6 @@ def main():
             if result and 'data' in result:
                 items = result['data']
                 
-                # 데이터 가공
                 data_list = []
                 for idx, item in enumerate(items):
                     data_list.append({
@@ -136,12 +151,10 @@ def main():
                         "로켓배송": "O" if item.get('isRocket', False) else "X",
                         "상품URL": item.get('productUrl', ''),
                         "이미지URL": item.get('productImage', '')
-                        # *참고: API 버전에 따라 리뷰수는 제공되지 않을 수 있습니다.
                     })
                 
                 df = pd.DataFrame(data_list)
 
-                # 1. 화면 출력 (이미지와 링크 포맷팅)
                 st.subheader(f"📊 검색 결과: {len(df)}개")
                 st.dataframe(
                     df,
@@ -154,7 +167,6 @@ def main():
                     hide_index=True
                 )
 
-                # 2. 엑셀 다운로드 버튼
                 excel_file = to_excel(df)
                 file_name = f"쿠팡베스트_{selected_cat_name}_{time.strftime('%Y%m%d')}.xlsx"
                 
@@ -166,9 +178,13 @@ def main():
                 )
 
             elif result and 'error' in result:
-                st.error(f"API 오류 발생: {result['error']}")
+                # [수정됨] 에러 상세 메시지 출력
+                st.error(f"⚠️ API 호출 실패: {result['error']}")
+                st.code(result.get('detail'), language="json")
+                st.info("💡 팁: 'code': 'BAD_REQUEST'가 나오면 카테고리 ID가 잘못되었거나, 키 값 앞뒤에 공백이 없는지 확인하세요.")
+            
             else:
-                st.error("데이터를 가져올 수 없습니다. API 키를 확인하거나 잠시 후 다시 시도해주세요.")
+                st.error("데이터를 가져올 수 없습니다. API 키를 확인해주세요.")
 
 if __name__ == "__main__":
     main()
