@@ -7,6 +7,8 @@ from datetime import datetime
 import pandas as pd
 import io
 import urllib.parse
+import random
+import time
 
 
 # ---------------------------------------------------------
@@ -70,6 +72,17 @@ CATEGORY_TREE = {
     },
 }
 
+# ---------------------------------------------------------
+# 랜덤 User-Agent 목록 (시크릿 모드 효과)
+# ---------------------------------------------------------
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile Safari/604.1",
+]
+
 
 # ---------------------------------------------------------
 # HMAC 서명 생성
@@ -87,25 +100,61 @@ def generate_hmac(method, url, secret_key, access_key):
 
 
 # ---------------------------------------------------------
-# 쿠팡 파트너스 상품 검색
+# 쿠팡 파트너스 상품 검색 (시크릿 모드 + 중복 제거)
 # ---------------------------------------------------------
 def search_products(access_key, secret_key, keyword, limit=10):
     DOMAIN = "https://api-gateway.coupang.com"
     encoded_keyword = urllib.parse.quote(keyword)
-    URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={limit}"
+
+    # 캐시 방지: 타임스탬프를 파라미터로 추가
+    timestamp = int(time.time() * 1000)
+    URL = f"/v2/providers/affiliate_open_api/apis/openapi/products/search?keyword={encoded_keyword}&limit={limit}&_t={timestamp}"
+
     authorization = generate_hmac("GET", URL, secret_key, access_key)
+
     headers = {
         "Authorization": authorization,
-        "Content-Type": "application/json;charset=UTF-8"
+        "Content-Type": "application/json;charset=UTF-8",
+        # 랜덤 User-Agent로 시크릿 모드 효과
+        "User-Agent": random.choice(USER_AGENTS),
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
     }
+
     try:
-        response = requests.get(f"{DOMAIN}{URL}", headers=headers, timeout=10)
+        # requests.Session() 새로 생성 → 쿠키/세션 초기화 효과
+        session = requests.Session()
+        session.cookies.clear()
+        response = session.get(f"{DOMAIN}{URL}", headers=headers, timeout=10)
+
         if response.status_code == 200:
             data = response.json()
-            return data.get("data", {}).get("productData", [])
-        return []
-    except Exception:
-        return []
+            products = data.get("data", {}).get("productData", [])
+
+            # ── 중복 제거: productId 기준 ──
+            seen_ids = set()
+            seen_names = set()
+            unique_products = []
+            for item in products:
+                pid = str(item.get("productId", ""))
+                pname = item.get("productName", "").strip()
+
+                # ID 중복 또는 상품명 완전 동일한 경우 제거
+                if pid and pid in seen_ids:
+                    continue
+                if pname and pname in seen_names:
+                    continue
+
+                seen_ids.add(pid)
+                seen_names.add(pname)
+                unique_products.append(item)
+
+            return {"success": True, "products": unique_products}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}", "msg": response.text}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ---------------------------------------------------------
@@ -124,6 +173,7 @@ def to_excel(df):
 def main():
     st.set_page_config(page_title="쿠팡 카테고리 순위", layout="wide")
     st.title("🏆 쿠팡 카테고리별 인기상품 순위")
+    st.caption("🔒 시크릿 모드 적용 | 중복 상품 자동 제거")
 
     missing = []
     if "COUPANG_ACCESS_KEY" not in st.secrets: missing.append("COUPANG_ACCESS_KEY")
@@ -135,73 +185,91 @@ def main():
     ACCESS_KEY = st.secrets["COUPANG_ACCESS_KEY"].strip().strip('"').strip("'")
     SECRET_KEY = st.secrets["COUPANG_SECRET_KEY"].strip().strip('"').strip("'")
 
+    # ── 사이드바: 카테고리 선택 ──
     st.sidebar.header("📂 카테고리 선택")
 
-    # 대카테고리
     big_cat = st.sidebar.selectbox("🔹 대카테고리", list(CATEGORY_TREE.keys()))
-
-    # 중카테고리
     mid_cats = list(CATEGORY_TREE[big_cat].keys())
     mid_cat = st.sidebar.selectbox("🔸 중카테고리", mid_cats)
-
-    # 소카테고리
     small_cats = CATEGORY_TREE[big_cat][mid_cat]
     selected_small = st.sidebar.selectbox("🔺 소카테고리", small_cats)
-
     limit_count = st.sidebar.slider("추출 상품 수", 1, 10, 10)
 
-    # 현재 선택 경로 표시
-    st.markdown(f"### 📌 선택 경로: `{big_cat}` > `{mid_cat}` > `{selected_small}`")
+    st.sidebar.divider()
+    st.sidebar.markdown("""
+    **🔒 시크릿 모드란?**
+    - 매 요청마다 새 세션 생성
+    - 랜덤 브라우저로 위장
+    - 캐시 완전 비활성화
+    - 쿠키 초기화
+    """)
+
+    # 선택 경로 표시
+    st.markdown(f"### 📌 `{big_cat}` > `{mid_cat}` > `{selected_small}`")
     st.divider()
 
     if st.sidebar.button("🏆 순위 조회", type="primary", use_container_width=True):
-        with st.spinner(f"'{selected_small}' 인기상품 순위 조회 중..."):
-            products = search_products(ACCESS_KEY, SECRET_KEY, selected_small, limit_count)
+        with st.spinner(f"🔒 시크릿 모드로 '{selected_small}' 순위 조회 중..."):
+            result = search_products(ACCESS_KEY, SECRET_KEY, selected_small, limit_count)
 
-        if products:
-            # 순위 기준 정렬 (rank 오름차순, 없으면 원래 순서)
+        if result["success"]:
+            products = result["products"]
+
+            if not products:
+                st.warning("검색 결과가 없습니다. 다른 소카테고리를 선택해보세요.")
+                return
+
+            # 순위 오름차순 정렬
             products_sorted = sorted(
                 products,
                 key=lambda x: int(x.get("rank", 999)) if x.get("rank") else 999
             )
 
-            df = pd.DataFrame([{
-                "순위": idx + 1,
-                "상품명": item.get("productName", "-"),
-                "가격(원)": f"{int(item.get('productPrice', 0)):,}" if item.get("productPrice") else "-",
-                "로켓배송": "🚀" if item.get("isRocket") else "일반",
-                "무료배송": "✅" if item.get("isFreeShipping") else "❌",
-                "상품링크": item.get("productUrl", ""),
-            } for idx, item in enumerate(products_sorted)])
+            total = len(products_sorted)
+            st.success(f"✅ **{big_cat} > {mid_cat} > {selected_small}** 인기상품 {total}개 (중복 제거 완료)")
 
-            st.success(f"✅ **{big_cat} > {mid_cat} > {selected_small}** 인기상품 {len(df)}개")
-
-            # 순위 카드 형태로 상위 3개 표시
-            if len(df) >= 3:
+            # TOP3 카드
+            if total >= 3:
                 st.markdown("#### 🥇🥈🥉 TOP 3")
                 col1, col2, col3 = st.columns(3)
                 medals = ["🥇", "🥈", "🥉"]
-                cols = [col1, col2, col3]
-                for i in range(3):
-                    with cols[i]:
-                        name = df.iloc[i]["상품명"]
-                        price = df.iloc[i]["가격(원)"]
-                        rocket = df.iloc[i]["로켓배송"]
-                        link = df.iloc[i]["상품링크"]
+                cols_ui = [col1, col2, col3]
+                for i in range(min(3, total)):
+                    item = products_sorted[i]
+                    name = item.get("productName", "-")
+                    price = item.get("productPrice", "-")
+                    rocket = "🚀 로켓" if item.get("isRocket") else "일반배송"
+                    link = item.get("productUrl", "")
+                    with cols_ui[i]:
                         st.markdown(f"""
-                        <div style='background:#f8f9fa;padding:14px;border-radius:10px;border:1px solid #dee2e6;min-height:120px'>
-                            <div style='font-size:22px'>{medals[i]}</div>
-                            <div style='font-size:13px;font-weight:600;margin:6px 0'>{name[:40]}{'...' if len(name)>40 else ''}</div>
-                            <div style='color:#e63946;font-weight:700'>{price}원</div>
-                            <div style='font-size:12px;color:#666'>{rocket}</div>
+                        <div style='background:#f8f9fa;padding:14px;border-radius:10px;
+                                    border:1px solid #dee2e6;min-height:130px'>
+                            <div style='font-size:24px'>{medals[i]}</div>
+                            <div style='font-size:13px;font-weight:600;margin:6px 0'>
+                                {name[:45]}{'...' if len(name)>45 else ''}
+                            </div>
+                            <div style='color:#e63946;font-weight:700'>
+                                {f"{int(price):,}원" if str(price).isdigit() else f"{price}원"}
+                            </div>
+                            <div style='font-size:12px;color:#888;margin-top:4px'>{rocket}</div>
                         </div>
                         """, unsafe_allow_html=True)
                         if link:
-                            st.markdown(f"[🔗 상품 보기]({link})", unsafe_allow_html=False)
+                            st.markdown(f"[🔗 상품 보기]({link})")
                 st.divider()
 
-            # 전체 테이블
+            # 전체 순위표
             st.markdown("#### 📋 전체 순위표")
+            df = pd.DataFrame([{
+                "순위": idx + 1,
+                "상품명": item.get("productName", "-"),
+                "가격(원)": f"{int(item.get('productPrice', 0)):,}" if str(item.get("productPrice","")).isdigit() else "-",
+                "로켓배송": "🚀" if item.get("isRocket") else "일반",
+                "무료배송": "✅" if item.get("isFreeShipping") else "❌",
+                "상품ID": str(item.get("productId", "-")),
+                "상품링크": item.get("productUrl", ""),
+            } for idx, item in enumerate(products_sorted)])
+
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             # 엑셀 다운로드
@@ -212,8 +280,11 @@ def main():
                 file_name=f"쿠팡_{big_cat}_{mid_cat}_{selected_small}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+
         else:
-            st.warning("검색 결과가 없습니다. 다른 소카테고리를 선택해보세요.")
+            st.error(f"❌ 조회 실패: {result.get('error')}")
+            with st.expander("상세 오류 보기"):
+                st.write(result.get("msg", ""))
             st.info("⚠️ 쿠팡 파트너스 API는 시간당 최대 10회 호출 가능합니다.")
 
 
