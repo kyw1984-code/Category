@@ -127,13 +127,3 @@ def main():
 
 
 main()
-```
-
----
-
-**requirements.txt** (이것도 GitHub에 꼭 있어야 해요!)
-```
-streamlit
-requests
-pandas
-xlsxwriter
